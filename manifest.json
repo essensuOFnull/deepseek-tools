@@ -1,0 +1,28 @@
+{
+  "manifest_version": 3,
+  "name": "DeepSeek Поколения",
+  "version": "5.0",
+  "description": "Реальное выполнение команд через маркеры, сохранение фактов, экспорт кода",
+  "permissions": ["storage", "scripting", "tabs"],
+  "host_permissions": ["https://chat.deepseek.com/*"],
+  "content_scripts": [
+    {
+      "matches": ["https://chat.deepseek.com/*"],
+      "js": ["content.js"],
+      "css": ["styles.css"],
+      "run_at": "document_end"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["sandbox.html"],
+      "matches": ["https://chat.deepseek.com/*"]
+    }
+  ],
+  "sandbox": {
+    "pages": ["sandbox.html"]
+  },
+  "content_security_policy": {
+    "sandbox": "sandbox allow-scripts; script-src 'unsafe-eval' 'self'"
+  }
+}
