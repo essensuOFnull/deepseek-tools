@@ -228,7 +228,91 @@ function executeJS(code) {
     };
   });
 }
+// ========== ФУНКЦИИ ДЛЯ НОВОГО ЧАТА ==========
 
+// Селектор кнопки New chat (на основе предоставленного HTML)
+const NEW_CHAT_BTN_SELECTOR = 'div._5a8ac7a.a084f19e[tabindex="0"]:has(> span:text("New chat"))';
+
+// Промпт, который будет передаваться в новый контекст
+const SYSTEM_PROMPT_TEXT = `[СИСТЕМНОЕ СООБЩЕНИЕ]
+Пользователь установил браузерное расширение, которое выполняет команды из твоих ответов. Команды оформляются как **блоки кода** с указанием языка-команды вместо названия языка программирования. Расширение находит такие блоки в видимом HTML твоего сообщения и выполняет их.
+
+Доступные языки-команды для блоков кода:
+- exec — выполняет JavaScript-код в изолированной песочнице и возвращает результат...
+... (полный текст из prompt.txt)
+При запуске диалога **обязательно** первым делом выполни facts, чтобы загрузить память. Все важные факты о пользователе хранятся там.`;
+
+// Функция ожидания появления элемента в DOM
+function waitForElement(selector, timeout = 10000) {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    const check = () => {
+      const el = document.querySelector(selector);
+      if (el) return resolve(el);
+      if (Date.now() - start > timeout) return reject(new Error('Timeout waiting for element: ' + selector));
+      setTimeout(check, 200);
+    };
+    check();
+  });
+}
+// ========== ПРОМПТ ИЗ ФАЙЛА ==========
+const PROMPT_URL = chrome.runtime.getURL('prompt.txt');
+let cachedPrompt = null;
+
+async function getPromptText() {
+  if (cachedPrompt) return cachedPrompt;
+  try {
+    const response = await fetch(PROMPT_URL);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    cachedPrompt = await response.text();
+    return cachedPrompt;
+  } catch (e) {
+    console.error('Ошибка загрузки prompt.txt:', e);
+    // Фолбэк — базовое сообщение, чтобы расширение не сломалось
+    return '[СИСТЕМНОЕ СООБЩЕНИЕ] Ошибка загрузки системного промпта. Пожалуйста, выполните facts вручную.';
+  }
+}
+// ========== ФУНКЦИЯ ОТКРЫТИЯ НОВОГО ЧАТА ==========
+async function openNewChat() {
+  // Ищем кнопку "New chat" по структуре, которую дал пользователь
+  const newChatBtn = document.querySelector('div._5a8ac7a.a084f19e[tabindex="0"]');
+  if (!newChatBtn) throw new Error('Кнопка New chat не найдена');
+  newChatBtn.click();
+  
+  // Ждём исчезновения старой переписки — проверяем, что старых сообщений больше нет
+  // и появился пустой плейсхолдер
+  await new Promise(resolve => setTimeout(resolve, 1000));
+  
+  // Дополнительная проверка: дожидаемся исчезновения всех ds-message элементов
+  const start = Date.now();
+  while (Date.now() - start < 5000) {
+    const oldMessages = document.querySelectorAll('.ds-message');
+    if (oldMessages.length === 0) break;
+    await new Promise(r => setTimeout(r, 500));
+  }
+  
+  // Теперь возвращаем поле ввода
+  return findChatInput(); // эта функция уже есть в content.js
+}
+// ========== ВСТАВКА ТЕКСТА И ОТПРАВКА ==========
+async function insertTextAndSend(input, text) {
+  // Эта функция будет вызываться из processCommands для нового чата
+  input.focus();
+  if (input.isContentEditable) {
+    input.textContent = '';
+    const selection = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(input);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    document.execCommand('insertText', false, text);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  } else if (input.tagName === 'TEXTAREA' || input.tagName === 'INPUT') {
+    input.value = text;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  await waitForSendButtonAndClick(input); // использует существующую функцию из content.js
+}
 // ========== ОБРАБОТКА КОМАНД ==========
 async function processCommands(container) {
   const statuses = [];
@@ -252,10 +336,10 @@ async function processCommands(container) {
     else if (lang === 'facts') {
       statuses.push(`📋 Сохранённые факты:\n${getFactsList()}`);
     }
-    else if (lang === 'clear:f') {
+    else if (lang === 'clear_all_facts') {
       statuses.push(clearFacts());
     }
-    else if (lang === 'export:f') {
+    else if (lang === 'export_facts') {
       try {
         const blob = new Blob([JSON.stringify(facts, null, 2)], { type: 'application/json' });
         const url = URL.createObjectURL(blob);
@@ -301,6 +385,24 @@ async function processCommands(container) {
       if (code.trim()) {
         sendAsUser(code.trim());
         statuses.push(`📨 Отправлено: "${code.trim().slice(0, 50)}${code.trim().length > 50 ? '...' : ''}"`);
+      }
+    }
+    else if (lang === 'new_chat') {
+      const instructions = code.trim();
+      if (!instructions) {
+        statuses.push('❌ Команда new_chat требует текст инструкций.');
+        continue;
+      }
+      try {
+        const systemPrompt = await getPromptText();
+        const finalMessage = systemPrompt + '\n\n' + instructions;
+        const newInput = await openNewChat();
+        await insertTextAndSend(newInput, finalMessage);
+        // Показываем уведомление на экране, а не отправляем сообщение
+        showNotification('🔄 Новый чат открыт и инструкции переданы.');
+        // statuses не добавляем, чтобы handleMessage не слал лишнего
+      } catch (e) {
+        statuses.push(`❌ Ошибка new_chat: ${e.message}`);
       }
     }
   }
