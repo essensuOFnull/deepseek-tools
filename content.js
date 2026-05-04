@@ -1,11 +1,27 @@
 // ========== ХРАНИЛИЩЕ ФАКТОВ И ХЕШЕЙ ==========
-let facts = [];
+let facts = {}; // словарь: id -> { timestamp, text }
 let processedHashes = new Set();
 
 function loadData() {
   return new Promise((resolve) => {
     chrome.storage.local.get(['deepseek_facts', 'processed_hashes'], (result) => {
-      facts = result.deepseek_facts ? JSON.parse(result.deepseek_facts) : [];
+      // Обработка фактов
+      if (result.deepseek_facts) {
+        const raw = JSON.parse(result.deepseek_facts);
+        if (Array.isArray(raw)) {
+          // Миграция из старого массива в словарь
+          facts = {};
+          raw.forEach((item, index) => {
+            const id = `legacy_${index + 1}`;
+            facts[id] = { timestamp: item.timestamp, text: item.text };
+          });
+        } else {
+          facts = raw; // уже объект
+        }
+      } else {
+        facts = {};
+      }
+      
       processedHashes = result.processed_hashes ? new Set(JSON.parse(result.processed_hashes)) : new Set();
       resolve();
     });
@@ -31,30 +47,38 @@ function hashText(text) {
 }
 
 // ========== ФАКТЫ ==========
-function addFact(text) {
-  facts.push({ timestamp: new Date().toISOString(), text });
-  saveFacts();
-  return `✅ Факт сохранён: "${text}" (всего ${facts.length})`;
+function generateFactId() {
+  // Короткий уникальный ID: время + случайная часть
+  return Date.now().toString(36) + '_' + Math.random().toString(36).substr(2, 5);
 }
 
-function deleteFact(index) {
-  if (index >= 1 && index <= facts.length) {
-    facts.splice(index - 1, 1);
+function addFact(text) {
+  const id = generateFactId();
+  facts[id] = { timestamp: new Date().toISOString(), text };
+  saveFacts();
+  return `✅ Факт сохранён (ID: ${id}): "${text}" (всего ${Object.keys(facts).length})`;
+}
+
+function deleteFact(id) {
+  if (facts.hasOwnProperty(id)) {
+    const text = facts[id].text;
+    delete facts[id];
     saveFacts();
-    return `🗑 Факт #${index} удалён (осталось ${facts.length})`;
+    return `🗑 Факт ${id} удалён: "${text}" (осталось ${Object.keys(facts).length})`;
   }
-  return `❌ Неверный номер факта: ${index}`;
+  return `❌ Факт с ID "${id}" не найден.`;
 }
 
 function clearFacts() {
-  facts = [];
+  facts = {};
   saveFacts();
   return '🧹 Все факты удалены';
 }
 
 function getFactsList() {
-  if (!facts.length) return 'нет сохранённых фактов.';
-  return facts.map((f, i) => `${i + 1}. [${f.timestamp}] ${f.text}`).join('\n');
+  const ids = Object.keys(facts);
+  if (!ids.length) return 'нет сохранённых фактов.';
+  return ids.map(id => `[${id}] ${facts[id].timestamp}: ${facts[id].text}`).join('\n');
 }
 
 // ========== УВЕДОМЛЕНИЯ ==========
@@ -360,9 +384,13 @@ async function processCommands(container) {
       const factText = code.trim();
       if (factText) statuses.push(addFact(factText));
     }
-    else if (lang === 'delete_fact') {
-      const n = parseInt(code.trim());
-      statuses.push(deleteFact(n));
+    else if (lang.startsWith('delete_fact:')) {
+      const factId = lang.substring('delete_fact:'.length).trim();
+      if (factId) {
+        statuses.push(deleteFact(factId));
+      } else {
+        statuses.push('❌ Укажите ID факта после delete_fact:');
+      }
     }
     else if (lang === 'exec') {
       const res = await executeJS(code);
