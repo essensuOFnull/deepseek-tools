@@ -1,28 +1,34 @@
+// content.js
 // ========== ХРАНИЛИЩЕ ФАКТОВ И ХЕШЕЙ ==========
-let facts = {}; // словарь: id -> { timestamp, text }
+let facts = {};
 let processedHashes = new Set();
+let commandsEnabled = true;
+let cachedPrompt = null; // ← исправлено (была утеряна)
 
 function loadData() {
   return new Promise((resolve) => {
-    chrome.storage.local.get(['deepseek_facts', 'processed_hashes'], (result) => {
-      // Обработка фактов
+    chrome.storage.local.get(['deepseek_facts', 'processed_hashes', 'commandsEnabled'], (result) => {
       if (result.deepseek_facts) {
         const raw = JSON.parse(result.deepseek_facts);
         if (Array.isArray(raw)) {
-          // Миграция из старого массива в словарь
           facts = {};
           raw.forEach((item, index) => {
             const id = `legacy_${index + 1}`;
             facts[id] = { timestamp: item.timestamp, text: item.text };
           });
         } else {
-          facts = raw; // уже объект
+          facts = raw;
         }
       } else {
         facts = {};
       }
-      
+
       processedHashes = result.processed_hashes ? new Set(JSON.parse(result.processed_hashes)) : new Set();
+      
+      if (result.commandsEnabled !== undefined) {
+        commandsEnabled = result.commandsEnabled;
+      }
+      
       resolve();
     });
   });
@@ -37,6 +43,10 @@ function saveProcessedHashes() {
   chrome.storage.local.set({ processed_hashes: JSON.stringify(arr) });
 }
 
+function saveCommandsEnabled() {
+  chrome.storage.local.set({ commandsEnabled });
+}
+
 function hashText(text) {
   let hash = 0;
   for (let i = 0; i < text.length; i++) {
@@ -48,7 +58,6 @@ function hashText(text) {
 
 // ========== ФАКТЫ ==========
 function generateFactId() {
-  // Короткий уникальный ID: время + случайная часть
   return Date.now().toString(36) + '_' + Math.random().toString(36).substr(2, 5);
 }
 
@@ -98,7 +107,6 @@ function showNotification(msg, isError = false) {
 
 // ========== ВСПЛЫВАЮЩЕЕ ОКНО ДЛЯ SHOW ==========
 function showPopup(htmlContent) {
-  // Удаляем предыдущее окно, если есть
   const existing = document.getElementById('deepseek-popup-overlay');
   if (existing) existing.remove();
 
@@ -135,17 +143,22 @@ function showPopup(htmlContent) {
   overlay.appendChild(container);
   document.body.appendChild(overlay);
 
-  // Закрытие по клику на фон
   overlay.addEventListener('click', (e) => {
     if (e.target === overlay) overlay.remove();
   });
 }
 
-// ========== ПОЛЕ ВВОДА ==========
+// ========== ПОЛЕ ВВОДА (универсальное) ==========
 function findChatInput() {
+  // 1. Обычный режим: div[contenteditable]
   const editable = document.querySelector('div[contenteditable="true"][role="textbox"]');
   if (editable) return editable;
 
+  // 2. Режим редактирования: textarea внутри .ds-textarea
+  const editTextarea = document.querySelector('.ds-textarea textarea');
+  if (editTextarea) return editTextarea;
+
+  // 3. Запасные варианты
   const selectors = [
     'textarea[placeholder*="DeepSeek"]',
     'textarea[placeholder*="Сообщение"]',
@@ -195,24 +208,55 @@ function sendAsUser(text) {
   waitForSendButtonAndClick(input);
 }
 
+// ========== ПОИСК КНОПКИ ОТПРАВКИ РЯДОМ С ПОЛЕМ ==========
+function findSendButton(input) {
+  if (input.closest) {
+    // 1. Режим редактирования
+    const editContainer = input.closest('.ds-textarea');
+    if (editContainer) {
+      const btn = editContainer.querySelector('div[role="button"].ds-basic-button--primary');
+      if (btn && btn.offsetParent !== null) return btn;
+    }
+
+    // 2. Обычный режим: ищем кнопку отправки (стрелка) с классом _52c986b в том же контейнере
+    const form = input.closest('form') || input.closest('[class*="chat"]') || document.body;
+    const sendBtn = form.querySelector('div[role="button"]._52c986b');
+    if (sendBtn && sendBtn.offsetParent !== null && !sendBtn.disabled) return sendBtn;
+
+    // Запасной: кнопка Send в режиме редактирования (если вдруг другой селектор)
+    const altSend = form.querySelector('div[role="button"].ds-basic-button--primary');
+    if (altSend && altSend.offsetParent !== null && !altSend.disabled) return altSend;
+  }
+
+  // Глобальный поиск (исключая наши кнопки)
+  const allBtns = document.querySelectorAll(
+    'button[aria-label="Send"], button[aria-label="Отправить"], button[title="Отправить"], ' +
+    'div[role="button"]._52c986b, div[role="button"].ds-basic-button--primary'
+  );
+  for (const btn of allBtns) {
+    if (btn.id === 'ext-insert-prompt' || btn.id === 'ext-commands-toggle') continue;
+    if (btn.closest('#ext-commands-toggle')) continue;
+    if (btn.offsetParent !== null && !btn.disabled) return btn;
+  }
+  return null;
+}
+
+// ========== ОТПРАВКА СООБЩЕНИЯ ==========
 function waitForSendButtonAndClick(input) {
-  const maxAttempts = 15;
+  const maxAttempts = 20; // чуть больше попыток
   let attempts = 0;
 
   const tryToSend = () => {
-    const sendBtn = document.querySelector(
-      'button[aria-label="Send"], button[data-testid="send-button"], ' +
-      'button[aria-label="Отправить"], button[title="Отправить"]'
-    );
-
-    if (sendBtn && !sendBtn.disabled) {
+    const sendBtn = findSendButton(input);
+    if (sendBtn && !sendBtn.disabled && sendBtn.offsetParent !== null) {
       sendBtn.click();
       return;
     }
 
     if (attempts++ < maxAttempts) {
-      setTimeout(tryToSend, 100);
+      setTimeout(tryToSend, 150); // чуть дольше интервал
     } else {
+      // Если не удалось, пробуем Enter на поле ввода
       const eventOpts = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true };
       input.dispatchEvent(new KeyboardEvent('keydown', eventOpts));
       input.dispatchEvent(new KeyboardEvent('keypress', eventOpts));
@@ -223,7 +267,7 @@ function waitForSendButtonAndClick(input) {
   tryToSend();
 }
 
-// ========== ВЫПОЛНЕНИЕ JS (общая функция) ==========
+// ========== ВЫПОЛНЕНИЕ JS ==========
 function executeJS(code) {
   return new Promise((resolve) => {
     const iframe = document.createElement('iframe');
@@ -252,39 +296,11 @@ function executeJS(code) {
     };
   });
 }
-// ========== ФУНКЦИИ ДЛЯ НОВОГО ЧАТА ==========
 
-// Селектор кнопки New chat (на основе предоставленного HTML)
-const NEW_CHAT_BTN_SELECTOR = 'div._5a8ac7a.a084f19e[tabindex="0"]:has(> span:text("New chat"))';
-
-// Промпт, который будет передаваться в новый контекст
-const SYSTEM_PROMPT_TEXT = `[СИСТЕМНОЕ СООБЩЕНИЕ]
-Пользователь установил браузерное расширение, которое выполняет команды из твоих ответов. Команды оформляются как **блоки кода** с указанием языка-команды вместо названия языка программирования. Расширение находит такие блоки в видимом HTML твоего сообщения и выполняет их.
-
-Доступные языки-команды для блоков кода:
-- exec — выполняет JavaScript-код в изолированной песочнице и возвращает результат...
-... (полный текст из prompt.txt)
-При запуске диалога **обязательно** первым делом выполни facts, чтобы загрузить память. Все важные факты о пользователе хранятся там.`;
-
-// Функция ожидания появления элемента в DOM
-function waitForElement(selector, timeout = 10000) {
-  return new Promise((resolve, reject) => {
-    const start = Date.now();
-    const check = () => {
-      const el = document.querySelector(selector);
-      if (el) return resolve(el);
-      if (Date.now() - start > timeout) return reject(new Error('Timeout waiting for element: ' + selector));
-      setTimeout(check, 200);
-    };
-    check();
-  });
-}
-// ========== ПРОМПТ ИЗ ФАЙЛА ==========
+// ========== ПРОМПТ ==========
 const PROMPT_URL = chrome.runtime.getURL('prompt.txt');
-let cachedPrompt = null;
 
 async function getPromptText() {
-  if (cachedPrompt) return cachedPrompt;
   try {
     const response = await fetch(PROMPT_URL);
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -292,54 +308,210 @@ async function getPromptText() {
     return cachedPrompt;
   } catch (e) {
     console.error('Ошибка загрузки prompt.txt:', e);
-    // Фолбэк — базовое сообщение, чтобы расширение не сломалось
     return '[СИСТЕМНОЕ СООБЩЕНИЕ] Ошибка загрузки системного промпта. Пожалуйста, выполните facts вручную.';
   }
 }
-// ========== ФУНКЦИЯ ОТКРЫТИЯ НОВОГО ЧАТА ==========
-async function openNewChat() {
-  // Ищем кнопку "New chat" по структуре, которую дал пользователь
-  const newChatBtn = document.querySelector('div._5a8ac7a.a084f19e[tabindex="0"]');
-  if (!newChatBtn) throw new Error('Кнопка New chat не найдена');
-  newChatBtn.click();
+
+// ========== НОВЫЕ КНОПКИ ==========
+function createCommandsToggle() {
+  const btn = document.createElement('div');
+  btn.id = 'ext-commands-toggle';
+  btn.setAttribute('role', 'button');
+  btn.setAttribute('tabindex', '0');
+  btn.className = 'ds-atom-button f79352dc ds-toggle-button ds-toggle-button--md';
+  btn.innerHTML = `<span class="_6dbc175">Команды расширения</span><div class="ds-focus-ring"></div>`;
   
-  // Ждём исчезновения старой переписки — проверяем, что старых сообщений больше нет
-  // и появился пустой плейсхолдер
-  await new Promise(resolve => setTimeout(resolve, 1000));
+  updateCommandsToggle(btn);
   
-  // Дополнительная проверка: дожидаемся исчезновения всех ds-message элементов
-  const start = Date.now();
-  while (Date.now() - start < 5000) {
-    const oldMessages = document.querySelectorAll('.ds-message');
-    if (oldMessages.length === 0) break;
-    await new Promise(r => setTimeout(r, 500));
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    commandsEnabled = !commandsEnabled;
+    saveCommandsEnabled();
+    updateCommandsToggle(btn);
+  });
+  
+  return btn;
+}
+
+function updateCommandsToggle(btn) {
+  if (commandsEnabled) {
+    btn.classList.add('ds-toggle-button--selected');
+  } else {
+    btn.classList.remove('ds-toggle-button--selected');
+  }
+}
+
+function createInsertPromptButton() {
+  const btn = document.createElement('div');
+  btn.id = 'ext-insert-prompt';
+  btn.setAttribute('role', 'button');
+  btn.setAttribute('tabindex', '0');
+  btn.className = 'ds-icon-button ds-icon-button--l ds-icon-button--sizing-container';
+  btn.innerHTML = `
+    <div class="ds-icon-button__hover-bg"></div>
+    <div class="ds-icon" style="font-size:14px; width:16px; height:16px; display:flex; align-items:center; justify-content:center;">P</div>
+    <div class="ds-focus-ring"></div>
+  `;
+  btn.title = 'Вставить начальный промпт';
+  
+  btn.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    const input = findChatInput();
+    if (!input) return;
+    const promptText = await getPromptText();
+    input.focus();
+    if (input.isContentEditable) {
+      document.execCommand('insertText', false, promptText);
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    } else if (input.tagName === 'TEXTAREA' || input.tagName === 'INPUT') {
+      input.value += promptText;
+      input.dispatchEvent(new Event('input', { bubbles: true }));
+    }
+  });
+  
+  return btn;
+}
+
+function injectButtons() {
+  const panel = document.querySelector('.ec4f5d61');
+  if (!panel) return;
+
+  if (document.getElementById('ext-commands-toggle') || document.getElementById('ext-insert-prompt')) return;
+
+  const toggles = panel.querySelectorAll(':scope > .ds-toggle-button');
+  const searchBtn = toggles.length >= 2 ? toggles[1] : null;
+  
+  if (searchBtn) {
+    const commandsToggle = createCommandsToggle();
+    searchBtn.after(commandsToggle);
+  }
+
+  const attachContainer = panel.querySelector('.bf38813a');
+  if (attachContainer) {
+    const insertBtn = createInsertPromptButton();
+    const firstChild = attachContainer.firstElementChild;
+    if (firstChild) {
+      attachContainer.insertBefore(insertBtn, firstChild);
+    } else {
+      attachContainer.appendChild(insertBtn);
+    }
+  }
+}
+
+function startInjectObserver() {
+  new MutationObserver((mutations) => {
+    for (const m of mutations) {
+      for (const node of m.addedNodes) {
+        if (node.nodeType !== 1) continue;
+        if (node.matches && node.matches('.ec4f5d61') || node.querySelector && node.querySelector('.ec4f5d61')) {
+          injectButtons();
+        }
+      }
+    }
+  }).observe(document.body, { childList: true, subtree: true });
+}
+
+// ========== ПЕРЕХВАТ ОТПРАВКИ (универсальный) ==========
+function isSystemMessage(text) {
+  return text.startsWith('[СИСТЕМНОЕ СООБЩЕНИЕ]') || text.includes('[СИСТЕМНАЯ ИНФОРМАЦИЯ]');
+}
+
+function getSystemInfoSuffix() {
+  const time = new Date().toLocaleString();
+  const status = commandsEnabled ? 'команды доступны' : 'команды отключены';
+  return `\n\n[СИСТЕМНАЯ ИНФОРМАЦИЯ] ${time}, ${status}`;
+}
+
+function addSystemInfoToInput(input) {
+  if (!input || input.dataset.systemInfoAdded === 'true') return;
+  
+  let text = '';
+  if (input.isContentEditable) {
+    text = input.textContent || '';
+  } else if (input.tagName === 'TEXTAREA' || input.tagName === 'INPUT') {
+    text = input.value || '';
   }
   
-  // Теперь возвращаем поле ввода
-  return findChatInput(); // эта функция уже есть в content.js
-}
-// ========== ВСТАВКА ТЕКСТА И ОТПРАВКА ==========
-async function insertTextAndSend(input, text) {
-  // Эта функция будет вызываться из processCommands для нового чата
-  input.focus();
+  if (!text.trim() || isSystemMessage(text)) return;
+  
+  const suffix = getSystemInfoSuffix();
+  
   if (input.isContentEditable) {
-    input.textContent = '';
     const selection = window.getSelection();
     const range = document.createRange();
     range.selectNodeContents(input);
+    range.collapse(false);
     selection.removeAllRanges();
     selection.addRange(range);
-    document.execCommand('insertText', false, text);
+    document.execCommand('insertText', false, suffix);
     input.dispatchEvent(new Event('input', { bubbles: true }));
-  } else if (input.tagName === 'TEXTAREA' || input.tagName === 'INPUT') {
-    input.value = text;
+  } else {
+    input.value += suffix;
     input.dispatchEvent(new Event('input', { bubbles: true }));
   }
-  await waitForSendButtonAndClick(input); // использует существующую функцию из content.js
+  
+  input.dataset.systemInfoAdded = 'true';
+  setTimeout(() => { delete input.dataset.systemInfoAdded; }, 100);
 }
+
+function setupSendInterception() {
+  // 1. Перехват клика по кнопкам отправки (точные селекторы)
+  document.body.addEventListener('click', (e) => {
+    // Ищем кнопку отправки: в обычном режиме div._52c986b, в режиме редактирования div.ds-basic-button--primary
+    const sendBtn = e.target.closest(
+      'button[aria-label="Send"], button[aria-label="Отправить"], button[title="Отправить"], ' +
+      'div[role="button"].ds-basic-button--primary, ' +   // Send в режиме редактирования
+      'div[role="button"]._52c986b'                       // стрелка в обычном режиме
+    );
+    if (!sendBtn || sendBtn.getAttribute('aria-disabled') === 'true') return;
+    // Исключаем наши кастомные кнопки
+    if (sendBtn.closest('#ext-commands-toggle') || sendBtn.closest('#ext-insert-prompt')) return;
+
+    let input = null;
+    const editContainer = sendBtn.closest('.ds-textarea');
+    if (editContainer) {
+      input = editContainer.querySelector('textarea');
+    }
+    if (!input) {
+      input = findChatInput();
+    }
+    if (input) addSystemInfoToInput(input);
+  }, true);
+
+  // 2. Перехват Enter остаётся без изменений
+  document.body.addEventListener('keydown', (e) => {
+    if (e.key !== 'Enter' || e.shiftKey || e.ctrlKey || e.metaKey) return;
+
+    let input = null;
+    // а) Режим редактирования
+    const editTextarea = document.querySelector('.ds-textarea textarea');
+    if (editTextarea && editTextarea.offsetParent !== null) {
+      input = editTextarea;
+    }
+    // б) Обычный режим
+    if (!input) {
+      const editable = document.querySelector('div[contenteditable="true"][role="textbox"]');
+      if (editable && editable.offsetParent !== null) {
+        input = editable;
+      }
+    }
+    // в) Запасные варианты
+    if (!input) {
+      const chatTextarea = document.querySelector('textarea[placeholder*="DeepSeek"], textarea[placeholder*="Сообщение"], textarea[placeholder*="Message"]');
+      if (chatTextarea && chatTextarea.offsetParent !== null) {
+        input = chatTextarea;
+      }
+    }
+    if (!input) return;
+
+    addSystemInfoToInput(input);
+  }, true);
+}
+
 // ========== ОБРАБОТКА КОМАНД ==========
 async function processCommands(container) {
   const statuses = [];
+  if (!commandsEnabled) return statuses;
 
   const html = getVisibleHTML(container);
   const parser = new DOMParser();
@@ -353,7 +525,6 @@ async function processCommands(container) {
     const codeEl = block.querySelector('pre');
     const code = codeEl ? codeEl.textContent : '';
 
-    // Простые команды (без аргументов)
     if (lang === 'now') {
       statuses.push(`⏰ Текущая дата и время: ${new Date().toLocaleString()}`);
     }
@@ -379,7 +550,6 @@ async function processCommands(container) {
         statuses.push('❌ Ошибка экспорта фактов');
       }
     }
-    // Команды с аргументом (текст из блока как параметр)
     else if (lang === 'save') {
       const factText = code.trim();
       if (factText) statuses.push(addFact(factText));
@@ -426,9 +596,7 @@ async function processCommands(container) {
         const finalMessage = systemPrompt + '\n\n' + instructions;
         const newInput = await openNewChat();
         await insertTextAndSend(newInput, finalMessage);
-        // Показываем уведомление на экране, а не отправляем сообщение
         showNotification('🔄 Новый чат открыт и инструкции переданы.');
-        // statuses не добавляем, чтобы handleMessage не слал лишнего
       } catch (e) {
         statuses.push(`❌ Ошибка new_chat: ${e.message}`);
       }
@@ -475,7 +643,6 @@ async function handleMessage(container) {
   await new Promise(resolve => waitForCompletion(container, resolve));
   container.dataset.processing = 'false';
 
-  // Теперь используем container напрямую для извлечения HTML
   const text = container.innerText || container.textContent || '';
   if (!text) return;
 
@@ -490,7 +657,7 @@ async function handleMessage(container) {
     return;
   }
 
-  const statuses = await processCommands(container); // передаём сам контейнер
+  const statuses = await processCommands(container);
 
   if (statuses.length > 0) {
     sendAsUser(statuses.join('\n'));
@@ -504,7 +671,6 @@ async function handleMessage(container) {
 // ========== ПОМЕТКА СУЩЕСТВУЮЩИХ ==========
 function markExisting() {
   document.querySelectorAll('.ds-message, [data-testid="message"], [class*="Message"]').forEach(c => {
-    // Просто помечаем все существующие как обработанные, без хеширования
     c.dataset.processed = 'true';
   });
 }
@@ -537,5 +703,11 @@ function startObserving() {
 window.addEventListener('load', async () => {
   await loadData();
   document.querySelectorAll('[data-processing="true"]').forEach(el => delete el.dataset.processing);
+  
+  // Внедряем кнопки и наблюдатель
+  injectButtons();
+  startInjectObserver();
+  setupSendInterception();
+
   startObserving();
 });
