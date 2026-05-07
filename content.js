@@ -507,7 +507,56 @@ function setupSendInterception() {
     addSystemInfoToInput(input);
   }, true);
 }
+// ========== ФУНКЦИИ ДЛЯ НОВОГО ЧАТА ==========
+const NEW_CHAT_BTN_SELECTOR = 'div._5a8ac7a.a084f19e[tabindex="0"]';
 
+function waitForElement(selector, timeout = 10000) {
+  return new Promise((resolve, reject) => {
+    const start = Date.now();
+    const check = () => {
+      const el = document.querySelector(selector);
+      if (el) return resolve(el);
+      if (Date.now() - start > timeout) return reject(new Error('Timeout waiting for element: ' + selector));
+      setTimeout(check, 200);
+    };
+    check();
+  });
+}
+
+async function openNewChat() {
+  const newChatBtn = document.querySelector('div._5a8ac7a.a084f19e[tabindex="0"]');
+  if (!newChatBtn) throw new Error('Кнопка New chat не найдена');
+  newChatBtn.click();
+  
+  await new Promise(resolve => setTimeout(resolve, 1000));
+  
+  const start = Date.now();
+  while (Date.now() - start < 5000) {
+    const oldMessages = document.querySelectorAll('.ds-message');
+    if (oldMessages.length === 0) break;
+    await new Promise(r => setTimeout(r, 500));
+  }
+  
+  return findChatInput();
+}
+
+async function insertTextAndSend(input, text) {
+  input.focus();
+  if (input.isContentEditable) {
+    input.textContent = '';
+    const selection = window.getSelection();
+    const range = document.createRange();
+    range.selectNodeContents(input);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    document.execCommand('insertText', false, text);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  } else if (input.tagName === 'TEXTAREA' || input.tagName === 'INPUT') {
+    input.value = text;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+  await waitForSendButtonAndClick(input);
+}
 // ========== ОБРАБОТКА КОМАНД ==========
 async function processCommands(container) {
   const statuses = [];
